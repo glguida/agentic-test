@@ -1,0 +1,598 @@
+#!/usr/bin/env python3
+"""Remote job backend for the GitHub AgentWS template."""
+
+from __future__ import annotations
+
+import json
+import os
+import re
+import sys
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+from urllib.error import HTTPError, URLError
+from urllib.parse import quote, urlencode
+from urllib.request import Request, urlopen
+
+
+NAME_RE = re.compile(r"^[A-Za-z0-9._-]+$")
+VALID_STATUSES = {"pending", "claimed", "running", "done", "failed"}
+
+ROOT = Path(__file__).resolve().parent.parent
+JOBS_DIR = Path(os.environ.get("JOBS_DIR", str(ROOT / "jobs")))
+
+
+def die(message: str, code: int = 1) -> None:
+    print(f"error: {message}", file=sys.stderr)
+    raise SystemExit(code)
+
+
+def validate_name(label: str, value: str) -> None:
+    if not value or NAME_RE.match(value) is None:
+        die(f"invalid {label} '{value}' - only alphanumeric, dot, underscore, and hyphen allowed")
+
+
+def validate_status(value: str) -> None:
+    if value not in VALID_STATUSES:
+        die(f"invalid status '{value}'")
+
+
+def positive_int(label: str, value: str) -> int:
+    try:
+        parsed = int(value)
+    except ValueError:
+        die(f"{label} must be a positive integer")
+    if parsed <= 0:
+        die(f"{label} must be greater than zero")
+    return parsed
+
+
+def read_endpoint_file(path: Path) -> str:
+    for line in path.read_text(encoding="utf-8").splitlines():
+        stripped = line.strip()
+        if stripped and not stripped.startswith("#"):
+            return stripped
+    die(f"server URL file '{path}' is empty")
+
+
+def server_url() -> str:
+    env = os.environ.get("AGENTWS_SERVER_URL")
+    if env:
+        return env.rstrip("/")
+    env_file = os.environ.get("AGENTWS_SERVER_FILE")
+    if env_file:
+        path = Path(env_file)
+        if path.is_file():
+            return read_endpoint_file(path).rstrip("/")
+        die(f"server URL file '{path}' does not exist")
+    path = ROOT / "server.url"
+    if path.is_file():
+        return read_endpoint_file(path).rstrip("/")
+    die("remote jobs are enabled but no server URL was found")
+
+
+def request(
+    method: str,
+    path: str,
+    payload: dict[str, object] | None = None,
+    query: dict[str, str] | None = None,
+) -> dict[str, object] | None:
+    url = server_url() + path
+    if query:
+        url = f"{url}?{urlencode(query)}"
+    data = None
+    headers = {"Accept": "application/json"}
+    if payload is not None:
+        data = json.dumps(payload).encode("utf-8")
+        headers["Content-Type"] = "application/json"
+    token = os.environ.get("AGENTWS_API_TOKEN")
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    req = Request(url, data=data, headers=headers, method=method)
+    try:
+        with urlopen(req, timeout=30) as response:
+            raw = response.read()
+            status = response.status
+    except HTTPError as exc:
+        raw = exc.read()
+        message = raw.decode("utf-8", "replace") or exc.reason
+        try:
+            parsed = json.loads(message)
+            if isinstance(parsed, dict) and parsed.get("error"):
+                message = str(parsed["error"])
+        except json.JSONDecodeError:
+            pass
+        die(f"{method} {path} failed: HTTP {exc.code}: {message}", exc.code)
+    except URLError as exc:
+        die(f"{method} {path} failed: {exc.reason}")
+    if status == 204 or not raw:
+        return None
+    parsed = json.loads(raw.decode("utf-8"))
+    if not isinstance(parsed, dict):
+        die("server returned non-object JSON")
+    return parsed
+
+
+def require_job(data: dict[str, object] | None) -> dict[str, object] | None:
+    if data is None:
+        return None
+    job = data.get("job")
+    if job is None:
+        return None
+    if not isinstance(job, dict):
+        die("server response did not include a valid job")
+    return job
+
+
+def write_file(path: Path, content: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f"{path.name}.tmp.{os.getpid()}")
+    tmp.write_text(content.rstrip("\n") + "\n", encoding="utf-8")
+    tmp.replace(path)
+
+
+def remove_file(path: Path) -> None:
+    try:
+        path.unlink()
+    except FileNotFoundError:
+        pass
+
+
+def event_heading(event: dict[str, object]) -> str:
+    kind = str(event.get("kind") or "event")
+    message = str(event.get("message") or "").strip()
+    if kind == "log" and message:
+        return message
+    if message:
+        return f"{kind.title()}: {message}"
+    return kind.title()
+
+
+def render_log(job: dict[str, object]) -> str:
+    events = job.get("events")
+    if not isinstance(events, list):
+        return ""
+    chunks: list[str] = []
+    for item in events:
+        if not isinstance(item, dict):
+            continue
+        ts = str(item.get("ts") or "")
+        chunks.append(f"## {ts} - {event_heading(item)}\n")
+        agent_id = item.get("agent_id")
+        detail = item.get("detail")
+        if agent_id:
+            chunks.append(f"Agent: {agent_id}\n")
+        if detail:
+            chunks.append(str(detail).rstrip() + "\n")
+        chunks.append("\n")
+    return "".join(chunks)
+
+
+def materialize(job: dict[str, object]) -> None:
+    job_id = str(job.get("id") or "")
+    role = str(job.get("role") or "")
+    task_id = str(job.get("task_id") or "")
+    status = str(job.get("status") or "")
+    spec = str(job.get("spec") or "")
+    agent_id = job.get("agent_id")
+
+    validate_name("job ID", job_id)
+    validate_name("role", role)
+    validate_name("task ID", task_id)
+    validate_status(status)
+
+    job_dir = JOBS_DIR / job_id
+    job_dir.mkdir(parents=True, exist_ok=True)
+    (job_dir / "workspace").mkdir(exist_ok=True)
+
+    write_file(job_dir / "spec.md", spec)
+    write_file(job_dir / "role", role)
+    write_file(job_dir / "task-id", task_id)
+    write_file(job_dir / "status", status)
+
+    if isinstance(agent_id, str) and agent_id:
+        validate_name("agent ID", agent_id)
+        write_file(job_dir / "agent-id", agent_id)
+    else:
+        remove_file(job_dir / "agent-id")
+
+    write_file(job_dir / "log.md", render_log(job))
+
+    lock_dir = job_dir / "lock"
+    if status in {"claimed", "running"} and isinstance(agent_id, str) and agent_id:
+        lock_dir.mkdir(exist_ok=True)
+    else:
+        try:
+            lock_dir.rmdir()
+        except OSError:
+            pass
+
+
+def print_job(job: dict[str, object]) -> None:
+    agent = job.get("agent_id")
+    suffix = f"  ({agent})" if agent else ""
+    print(
+        f"{str(job.get('id', '-')):<24}  "
+        f"{str(job.get('task_id', '-')):<18}  "
+        f"{str(job.get('status', '-')):<10}  "
+        f"{str(job.get('role', '-')):<14}{suffix}"
+    )
+
+
+def list_jobs(status: str | None = None, role: str | None = None) -> list[dict[str, object]]:
+    query: dict[str, str] = {}
+    if status:
+        query["status"] = status
+    if role:
+        query["role"] = role
+    data = request("GET", "/jobs", query=query)
+    jobs = data.get("jobs", []) if data else []
+    if not isinstance(jobs, list):
+        die("server response did not include a job list")
+    return [job for job in jobs if isinstance(job, dict)]
+
+
+def cmd_create(argv: list[str]) -> int:
+    job_id = ""
+    role = ""
+    task_id = ""
+    spec_file = ""
+    args = list(argv)
+    while args:
+        item = args.pop(0)
+        if item in ("-r", "--role"):
+            if not args:
+                die(f"{item} requires a role")
+            role = args.pop(0)
+        elif item in ("-t", "--task-id"):
+            if not args:
+                die(f"{item} requires a task ID")
+            task_id = args.pop(0)
+        elif item in ("--help", "-h"):
+            print("Usage: job-create <job-id> -r <role> -t <task-id> <spec-file>")
+            return 0
+        elif not job_id:
+            job_id = item
+        elif not spec_file:
+            spec_file = item
+        else:
+            die(f"unexpected argument '{item}'")
+
+    if not job_id or not role or not task_id or not spec_file:
+        die("usage: job-create <job-id> -r <role> -t <task-id> <spec-file>")
+    validate_name("job ID", job_id)
+    validate_name("role", role)
+    validate_name("task ID", task_id)
+    path = Path(spec_file)
+    if not path.is_file():
+        die(f"spec file '{spec_file}' does not exist")
+    spec = path.read_text(encoding="utf-8")
+    if not spec.strip():
+        die(f"spec file '{spec_file}' is empty")
+
+    data = request(
+        "POST",
+        "/jobs",
+        {"id": job_id, "role": role, "task_id": task_id, "spec": spec},
+    )
+    job = require_job(data)
+    if not job:
+        die("server did not return a job")
+    if data and data.get("created") is False:
+        die(f"job '{job_id}' already exists")
+    print(f"created: remote job {job_id} (task: {task_id}, role: {role})")
+    return 0
+
+
+def cmd_wait(argv: list[str]) -> int:
+    role = ""
+    wait_interval = positive_int("AGENTWS_WAIT_INTERVAL", os.environ.get("AGENTWS_WAIT_INTERVAL", "5"))
+    args = list(argv)
+    while args:
+        item = args.pop(0)
+        if item in ("-r", "--role"):
+            if not args:
+                die(f"{item} requires a role")
+            role = args.pop(0)
+        elif item in ("--help", "-h"):
+            print("Usage: job-wait [-r <role>]")
+            return 0
+        else:
+            die(f"unknown option '{item}'")
+    if role:
+        validate_name("role", role)
+    while True:
+        if list_jobs(status="pending", role=role or None):
+            return 0
+        time.sleep(wait_interval)
+
+
+def cmd_claim(argv: list[str]) -> int:
+    job_id = ""
+    role = ""
+    agent_id = ""
+    args = list(argv)
+    while args:
+        item = args.pop(0)
+        if item in ("-r", "--role"):
+            if not args:
+                die(f"{item} requires a role")
+            role = args.pop(0)
+        elif item == "--agent-id":
+            if not args:
+                die("--agent-id requires an agent ID")
+            agent_id = args.pop(0)
+        elif item in ("--help", "-h"):
+            print("Usage: job-claim [job-id] [-r <role>] --agent-id <agent-id>")
+            return 0
+        elif not job_id:
+            job_id = item
+        else:
+            die(f"unexpected argument '{item}'")
+
+    if role:
+        validate_name("role", role)
+    if not agent_id:
+        die("--agent-id <agent-id> is required")
+    validate_name("agent ID", agent_id)
+
+    payload: dict[str, object] = {"agent_id": agent_id}
+    if role:
+        payload["role"] = role
+    path = "/jobs/claim" if not job_id else f"/jobs/{quote(job_id)}/claim"
+    if job_id:
+        validate_name("job ID", job_id)
+    data = request("POST", path, payload)
+    job = require_job(data)
+    if job is None:
+        print("NO_JOBS")
+        return 0
+    materialize(job)
+    print(f"CLAIMED: {job['id']}")
+    return 0
+
+
+def parse_transition(argv: list[str], *, message_required: bool) -> tuple[str, str, str]:
+    job_id = ""
+    agent_id = ""
+    message = ""
+    args = list(argv)
+    while args:
+        item = args.pop(0)
+        if item == "--agent-id":
+            if not args:
+                die("--agent-id requires an agent ID")
+            agent_id = args.pop(0)
+        elif item == "-m":
+            if not args:
+                die("-m requires a message")
+            message = args.pop(0)
+        elif item in ("--help", "-h"):
+            raise SystemExit(0)
+        elif not job_id:
+            job_id = item
+        else:
+            die(f"unexpected argument '{item}'")
+    if not job_id:
+        die("job ID is required")
+    if not agent_id:
+        die("--agent-id <agent-id> is required")
+    if message_required and not message:
+        die("-m <message> is required")
+    validate_name("job ID", job_id)
+    validate_name("agent ID", agent_id)
+    return job_id, agent_id, message
+
+
+def transition(argv: list[str], action: str, old: str, new: str, *, message_required: bool = False) -> int:
+    job_id, agent_id, message = parse_transition(argv, message_required=message_required)
+    payload: dict[str, object] = {"agent_id": agent_id}
+    if message:
+        payload["message"] = message
+    elif action == "start":
+        payload["message"] = f"Job started by agent {agent_id}."
+    data = request("POST", f"/jobs/{quote(job_id)}/{action}", payload)
+    job = require_job(data)
+    if job:
+        materialize(job)
+    print(f"{job_id}: {old} -> {new}")
+    return 0
+
+
+def cmd_log(argv: list[str]) -> int:
+    job_id = ""
+    agent_id = ""
+    summary = ""
+    detail = ""
+    args = list(argv)
+    while args:
+        item = args.pop(0)
+        if item == "--agent-id":
+            if not args:
+                die("--agent-id requires an agent ID")
+            agent_id = args.pop(0)
+        elif item in ("-s", "--summary"):
+            if not args:
+                die(f"{item} requires a summary")
+            summary = args.pop(0)
+        elif item in ("-d", "--detail"):
+            if not args:
+                die(f"{item} requires detail")
+            detail = args.pop(0)
+        elif item in ("--help", "-h"):
+            print("Usage: job-log <job-id> [--agent-id <agent-id>] -s <summary> [-d <detail>]")
+            return 0
+        elif not job_id:
+            job_id = item
+        else:
+            die(f"unexpected argument '{item}'")
+    if not job_id:
+        die("job ID is required")
+    if not summary:
+        die("-s <summary> is required")
+    validate_name("job ID", job_id)
+    payload: dict[str, object] = {"summary": summary, "detail": detail}
+    if agent_id:
+        validate_name("agent ID", agent_id)
+        payload["agent_id"] = agent_id
+    data = request("POST", f"/jobs/{quote(job_id)}/log", payload)
+    job = require_job(data)
+    if job:
+        materialize(job)
+    print(f"{job_id}: log appended")
+    return 0
+
+
+def cmd_list(argv: list[str]) -> int:
+    if len(argv) > 1:
+        die(f"unexpected argument '{argv[1]}'")
+    status = argv[0] if argv else ""
+    if status:
+        validate_status(status)
+    jobs = list_jobs(status=status or None)
+    if not jobs:
+        print(f"No jobs with status '{status}'." if status else "No jobs found.")
+        return 0
+    for job in jobs:
+        print_job(job)
+    return 0
+
+
+def cmd_mine(argv: list[str]) -> int:
+    agent_id = ""
+    args = list(argv)
+    while args:
+        item = args.pop(0)
+        if item == "--agent-id":
+            if not args:
+                die("--agent-id requires an agent ID")
+            agent_id = args.pop(0)
+        elif item in ("--help", "-h"):
+            print("Usage: job-mine --agent-id <agent-id>")
+            return 0
+        else:
+            die(f"unexpected argument '{item}'")
+    if not agent_id:
+        die("--agent-id <agent-id> is required")
+    validate_name("agent ID", agent_id)
+    for job in list_jobs():
+        if job.get("agent_id") == agent_id:
+            print(
+                f"{job.get('id')} ({job.get('status')}, "
+                f"task: {job.get('task_id')}, role: {job.get('role')})"
+            )
+    return 0
+
+
+def cmd_watch(argv: list[str]) -> int:
+    if not argv:
+        die("usage: job-watch <status> [--poll <seconds>]")
+    status = argv[0]
+    validate_status(status)
+    poll = 5
+    args = list(argv[1:])
+    while args:
+        item = args.pop(0)
+        if item == "--poll":
+            if not args:
+                die("--poll requires seconds")
+            poll = positive_int("--poll", args.pop(0))
+        elif item in ("--help", "-h"):
+            print("Usage: job-watch <status> [--poll <seconds>]")
+            return 0
+        else:
+            die(f"unknown option '{item}'")
+    seen: set[str] = set()
+    while True:
+        current = {str(job.get("id")) for job in list_jobs(status=status)}
+        for job_id in sorted(current - seen):
+            print(f"[{timestamp()}] {job_id} -> {status}", flush=True)
+        seen = current
+        time.sleep(poll)
+
+
+def timestamp() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def parse_ts(value: object) -> datetime | None:
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        return datetime.strptime(value, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+    except ValueError:
+        return None
+
+
+def cmd_reap(argv: list[str]) -> int:
+    if len(argv) > 1:
+        die(f"unexpected argument '{argv[1]}'")
+    stale_minutes = positive_int("minutes", argv[0]) if argv else 60
+    cutoff = datetime.now(timezone.utc).timestamp() - stale_minutes * 60
+    print(f"Reaping remote jobs stale for more than {stale_minutes} minutes...")
+    count = 0
+    for job in list_jobs():
+        if job.get("status") not in {"claimed", "running"}:
+            continue
+        agent_id = job.get("agent_id")
+        if not isinstance(agent_id, str) or not agent_id:
+            continue
+        updated = parse_ts(job.get("updated_at")) or parse_ts(job.get("started_at")) or parse_ts(job.get("claimed_at"))
+        if updated is None or updated.timestamp() > cutoff:
+            continue
+        job_id = str(job.get("id"))
+        print(f"reaping: {job_id} (status: {job.get('status')}, agent: {agent_id})")
+        data = request(
+            "POST",
+            f"/jobs/{quote(job_id)}/release",
+            {
+                "agent_id": agent_id,
+                "message": f"Reset by job-reap after more than {stale_minutes} minutes.",
+            },
+        )
+        updated_job = require_job(data)
+        if updated_job:
+            materialize(updated_job)
+        count += 1
+    print(f"Reaped {count} job(s).")
+    return 0
+
+
+def cmd_remote_unsupported(name: str) -> int:
+    print(f"{name}: remote job backend cannot determine global orphans from this checkout.")
+    print("Use job-reap <minutes> to release stale claimed/running jobs by server timestamp.")
+    return 0
+
+
+COMMANDS = {
+    "create": cmd_create,
+    "wait": cmd_wait,
+    "claim": cmd_claim,
+    "start": lambda argv: transition(argv, "start", "claimed", "running"),
+    "done": lambda argv: transition(argv, "done", "running", "done", message_required=True),
+    "fail": lambda argv: transition(argv, "fail", "claimed/running", "failed", message_required=True),
+    "release": lambda argv: transition(argv, "release", "claimed/running", "pending", message_required=True),
+    "log": cmd_log,
+    "list": cmd_list,
+    "mine": cmd_mine,
+    "watch": cmd_watch,
+    "reap": cmd_reap,
+    "orphans": lambda argv: cmd_remote_unsupported("job-orphans"),
+    "reset-orphans": lambda argv: cmd_remote_unsupported("job-reset-orphans"),
+}
+
+
+def main(argv: list[str]) -> int:
+    if len(argv) < 2 or argv[1] in {"--help", "-h"}:
+        names = " ".join(sorted(COMMANDS))
+        print(f"Usage: job-remote <{names}> ...")
+        return 0 if len(argv) >= 2 else 1
+    command = argv[1]
+    func = COMMANDS.get(command)
+    if func is None:
+        die(f"unknown remote job command '{command}'")
+    return func(argv[2:])
+
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv))

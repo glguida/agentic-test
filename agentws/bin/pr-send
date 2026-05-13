@@ -1,0 +1,96 @@
+#!/bin/sh
+set -eu
+
+AGENTWS_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+. "$AGENTWS_ROOT/bin/lib-agentws"
+
+usage() {
+    echo "Usage: pr-send <task-id> <worktree> <base-branch> <work-branch> <title> <body-file>"
+    echo ""
+    echo "Publish a reviewed work branch and print the PR URL."
+    exit 1
+}
+
+parse_github_repo() {
+    remote_url="$1"
+    value="${remote_url%.git}"
+
+    case "$value" in
+        https://github.com/*/*)
+            value="${value#https://github.com/}"
+            ;;
+        git@github.com:*/*)
+            value="${value#git@github.com:}"
+            ;;
+        ssh://git@github.com/*/*)
+            value="${value#ssh://git@github.com/}"
+            ;;
+        *)
+            die "cannot parse upstream repository from remote URL '$remote_url'"
+            ;;
+    esac
+
+    owner="${value%%/*}"
+    repo="${value#*/}"
+    [ -n "$owner" ] || die "cannot parse upstream owner from remote URL '$remote_url'"
+    [ -n "$repo" ] || die "cannot parse upstream repo from remote URL '$remote_url'"
+    printf '%s/%s\n' "$owner" "$repo"
+}
+
+[ "$#" -eq 6 ] || usage
+
+TASK_ID="$1"
+WORKTREE="$2"
+BASE_BRANCH="$3"
+WORK_BRANCH="$4"
+TITLE="$5"
+BODY_FILE="$6"
+
+validate_task_id "$TASK_ID"
+[ -d "$WORKTREE" ] || die "worktree '$WORKTREE' does not exist"
+[ -f "$BODY_FILE" ] || die "body file '$BODY_FILE' does not exist"
+[ -s "$BODY_FILE" ] || die "body file '$BODY_FILE' is empty"
+command -v gh >/dev/null 2>&1 || die "gh is required for this publication tool"
+git -C "$WORKTREE" check-ref-format --branch "$BASE_BRANCH" >/dev/null 2>&1 ||
+    die "invalid base branch '$BASE_BRANCH'"
+git -C "$WORKTREE" check-ref-format --branch "$WORK_BRANCH" >/dev/null 2>&1 ||
+    die "invalid work branch '$WORK_BRANCH'"
+
+UPSTREAM_URL="$(git -C "$WORKTREE" remote get-url upstream)"
+UPSTREAM_REPO="$(parse_github_repo "$UPSTREAM_URL")"
+LOGIN="$(gh api user --jq .login)"
+[ -n "$LOGIN" ] || die "could not determine authenticated login"
+
+tmp_body="${TMPDIR:-/tmp}/agentws-pr-body.$$"
+trap 'rm -f "$tmp_body"' EXIT HUP INT TERM
+
+{
+    cat "$BODY_FILE"
+    printf '\n\nTask: #%s\n' "$TASK_ID"
+} > "$tmp_body"
+
+git -C "$WORKTREE" push -u origin "$WORK_BRANCH"
+
+if pr_url="$(gh pr create \
+    --repo "$UPSTREAM_REPO" \
+    --base "$BASE_BRANCH" \
+    --head "$LOGIN:$WORK_BRANCH" \
+    --title "$TITLE" \
+    --body-file "$tmp_body" 2>&1)"; then
+    printf '%s\n' "$pr_url"
+    exit 0
+fi
+
+existing="$(gh pr list \
+    --repo "$UPSTREAM_REPO" \
+    --head "$LOGIN:$WORK_BRANCH" \
+    --state all \
+    --json url \
+    --jq '.[0].url' 2>/dev/null || true)"
+
+if [ -n "$existing" ] && [ "$existing" != "null" ]; then
+    printf '%s\n' "$existing"
+    exit 0
+fi
+
+die "failed to create PR: $pr_url"

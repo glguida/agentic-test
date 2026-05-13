@@ -1,0 +1,14 @@
+# GitHub template note:
+# Task commands are backed by the repository pointed to by the local `upstream`
+# remote. The task tools require the GitHub CLI (`gh`) authenticated with
+# `gh auth login`; agents should still use bin/task-* for task state.
+#
+# If agentws/server.url exists, job commands use that remote AgentWS job server
+# and mirror claimed jobs under agentws/jobs/. Without server.url, jobs are
+# stored locally under agentws/jobs/.
+#
+# AgentWS-owned issue labels are prefixed with the authenticated GitHub login:
+#   gh api user --jq .login
+# producing:
+#   <login>-agentws-running
+#   <login>-agentws-done

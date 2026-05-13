@@ -1,0 +1,22 @@
+#!/bin/sh
+set -eu
+
+AGENTWS_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+. "$AGENTWS_ROOT/bin/lib-agentws"
+
+usage() {
+    echo "Usage: task-result <task-id> <result-file>"
+    exit 1
+}
+
+[ "$#" -eq 2 ] || usage
+
+TASK_ID="$1"
+RESULT_FILE="$2"
+
+validate_task_id "$TASK_ID"
+[ -f "$RESULT_FILE" ] || die "result file '$RESULT_FILE' does not exist"
+[ -s "$RESULT_FILE" ] || die "result file '$RESULT_FILE' is empty"
+
+"$AGENTWS_ROOT/bin/task-github" result "$TASK_ID" "$RESULT_FILE"
+echo "$TASK_ID: result recorded"

@@ -1,0 +1,12 @@
+#!/bin/sh
+
+terminal_create() {
+    name="$1"
+    case "$name" in
+        ""|*[!A-Za-z0-9._-]*)
+            die "invalid terminal name '$name'"
+            ;;
+    esac
+
+    printf '/dev/null\n'
+}

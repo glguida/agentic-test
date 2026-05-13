@@ -1,0 +1,17 @@
+#!/bin/sh
+set -eu
+
+AGENTWS_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+. "$AGENTWS_ROOT/bin/lib-agentws"
+
+usage() {
+    echo "Usage: task-show <task-id>"
+    exit 1
+}
+
+[ "$#" -eq 1 ] || usage
+
+TASK_ID="$1"
+validate_task_id "$TASK_ID"
+
+"$AGENTWS_ROOT/bin/task-github" show "$TASK_ID"

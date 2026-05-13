@@ -1,0 +1,8 @@
+# AgentWS team file
+# Format: <name> <role> <agent> [model]
+# Agent is one of: pi, codex, claude
+
+planner-1 planner pi
+implementer-1 implementer pi
+reviewer-1 reviewer pi
+pr-sender-1 pr-sender pi

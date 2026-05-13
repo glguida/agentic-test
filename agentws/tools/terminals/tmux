@@ -1,0 +1,130 @@
+#!/bin/sh
+
+terminal_init() {
+    require_command tmux
+    require_command jq
+    require_command mkfifo
+    [ -n "$TERMINAL_ARG" ] || die "tmux terminal requires a session name"
+
+    TERMINAL_STATE_DIR="$RUNS_DIR/terminals"
+    mkdir -p "$TERMINAL_STATE_DIR"
+}
+
+terminal_create() {
+    name="$1"
+    case "$name" in
+        ""|*[!A-Za-z0-9._-]*)
+            die "invalid terminal name '$name'"
+            ;;
+    esac
+
+    if tmux has-session -t "$TERMINAL_ARG" 2>/dev/null; then
+        output="$(tmux new-window -d -P -F '#{window_id} #{pane_tty}' -t "$TERMINAL_ARG:" -n "$name" "sh -c 'while :; do sleep 3600; done'")" || {
+            return 1
+        }
+    else
+        output="$(tmux new-session -d -P -F '#{window_id} #{pane_tty}' -s "$TERMINAL_ARG" -n "$name" "sh -c 'while :; do sleep 3600; done'")" || {
+            return 1
+        }
+    fi
+
+    target="${output%% *}"
+    tty="${output#* }"
+
+    printf '%s\n' "$target" > "$TERMINAL_STATE_DIR/$name.target"
+
+    if [ "$name" = "supervisor" ]; then
+        printf '%s\n' "$tty"
+        return 0
+    fi
+
+    fifo="$TERMINAL_STATE_DIR/$name.fifo"
+    rm -f "$fifo"
+    mkfifo "$fifo" || {
+        tmux kill-window -t "$target" 2>/dev/null || true
+        rm -f "$TERMINAL_STATE_DIR/$name.target"
+        return 1
+    }
+
+    (
+        exec 4<>"$fifo" || exit 0
+        jq -Rr '
+            def strings:
+                if type == "string" then .
+                elif type == "array" then .[] | strings
+                elif type == "object" then
+                    (
+                        .text?,
+                        .content?,
+                        .delta?,
+                        .message?,
+                        .data?,
+                        .value?,
+                        .output?,
+                        ((.choices? // [])[]? | .delta?.content?, .message?.content?)
+                    ) | strings
+                else empty end;
+
+            def first_text:
+                [strings | select(length > 0)] | .[0] // "";
+
+            def event_kind:
+                ((.type? // .event? // .kind? // .role? // .channel? // .name? // "") | tostring | ascii_downcase);
+
+            . as $raw
+            | (try fromjson catch null) as $json
+            | if $json == null then
+                  $raw
+              else
+                  ($json | first_text) as $text
+                  | if ($text | length) == 0 then
+                        empty
+                    else
+                        ($json | event_kind) as $kind
+                        | if ($kind | test("think|reason|analysis")) then
+                              "\u001b[2;3m[thinking] \($text)\u001b[0m"
+                          elif ($kind | test("error|warn")) then
+                              "\u001b[31m\($text)\u001b[0m"
+                          else
+                              "\u001b[1m\($text)\u001b[0m"
+                          end
+                    end
+              end
+        ' <&4 > "$tty" 2>/dev/null
+    ) >/dev/null 2>&1 &
+    formatter_pid="$!"
+
+    printf '%s\n' "$formatter_pid" > "$TERMINAL_STATE_DIR/$name.formatter"
+    printf '%s\n' "$fifo" > "$TERMINAL_STATE_DIR/$name.fifo-path"
+    printf '%s\n' "$fifo"
+}
+
+terminal_destroy() {
+    name="$1"
+    case "$name" in
+        ""|*[!A-Za-z0-9._-]*)
+            return 0
+            ;;
+    esac
+
+    target_file="$TERMINAL_STATE_DIR/$name.target"
+    [ -f "$target_file" ] || return 0
+
+    formatter_file="$TERMINAL_STATE_DIR/$name.formatter"
+    if [ -f "$formatter_file" ]; then
+        formatter_pid="$(cat "$formatter_file" 2>/dev/null || true)"
+        [ -n "$formatter_pid" ] && kill "$formatter_pid" 2>/dev/null || true
+        rm -f "$formatter_file"
+    fi
+
+    fifo_file="$TERMINAL_STATE_DIR/$name.fifo-path"
+    if [ -f "$fifo_file" ]; then
+        fifo="$(cat "$fifo_file" 2>/dev/null || true)"
+        [ -n "$fifo" ] && rm -f "$fifo"
+        rm -f "$fifo_file"
+    fi
+
+    target="$(cat "$target_file" 2>/dev/null || true)"
+    [ -n "$target" ] && tmux kill-window -t "$target" 2>/dev/null || true
+    rm -f "$target_file"
+}

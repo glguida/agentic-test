@@ -1,0 +1,365 @@
+#!/usr/bin/env python3
+"""GitHub issue implementation for AgentWS task commands via gh."""
+
+from __future__ import annotations
+
+import json
+import re
+import shutil
+import subprocess
+import sys
+from pathlib import Path
+from urllib.parse import quote
+
+
+ISSUE_RE = re.compile(r"/issues/([0-9]+)(?:$|[^0-9])")
+
+
+def die(message: str) -> None:
+    print(f"error: {message}", file=sys.stderr)
+    raise SystemExit(1)
+
+
+def root_dir() -> Path:
+    return Path(__file__).resolve().parent.parent
+
+
+def repo_root() -> Path:
+    return root_dir().parent
+
+
+def parse_github_repo(remote_url: str) -> tuple[str, str]:
+    value = remote_url.strip()
+    value = value.removesuffix(".git")
+    match = re.search(r"github\.com[:/]([^/]+)/([^/]+)$", value)
+    if match is None:
+        die(f"cannot parse GitHub owner/repo from upstream remote: {remote_url}")
+    return match.group(1), match.group(2)
+
+
+def upstream_repo() -> tuple[str, str]:
+    remote = run_git(["remote", "get-url", "upstream"])
+    return parse_github_repo(remote)
+
+
+def validate_login(value: str) -> str:
+    if not value:
+        die("GitHub login cannot be empty")
+    for char in value:
+        if not (char.isalnum() or char in "._-"):
+            die("GitHub login may only contain alphanumeric, dot, underscore, and hyphen")
+    return value
+
+
+def require_gh() -> None:
+    if shutil.which("gh") is None:
+        die("GitHub task mode requires the GitHub CLI: gh")
+
+
+def run_git(args: list[str]) -> str:
+    proc = subprocess.run(
+        ["git", *args],
+        cwd=repo_root(),
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+    if proc.returncode != 0:
+        detail = (proc.stderr or proc.stdout).strip()
+        die(f"git {' '.join(args)} failed: {detail or f'exit status {proc.returncode}'}")
+    return proc.stdout.strip()
+
+
+def run_gh(args: list[str], *, ignore_failure: bool = False) -> str:
+    require_gh()
+    proc = subprocess.run(
+        ["gh", *args],
+        cwd=repo_root(),
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+    if proc.returncode != 0:
+        if ignore_failure:
+            return ""
+        detail = (proc.stderr or proc.stdout).strip()
+        die(f"gh {' '.join(args)} failed: {detail or f'exit status {proc.returncode}'}")
+    return proc.stdout.strip()
+
+
+def try_gh(args: list[str]) -> bool:
+    require_gh()
+    proc = subprocess.run(
+        ["gh", *args],
+        cwd=repo_root(),
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+    return proc.returncode == 0
+
+
+def authenticated_login() -> str:
+    login = run_gh(["api", "user", "--jq", ".login"]).strip()
+    if not login:
+        die("could not determine GitHub login; run gh auth login")
+    return validate_login(login)
+
+
+class GitHub:
+    def __init__(self, owner: str, repo: str, gid: str) -> None:
+        self.owner = owner
+        self.repo = repo
+        self.repo_arg = f"{owner}/{repo}"
+        self.running_label = f"{gid}-agentws-running"
+        self.done_label = f"{gid}-agentws-done"
+
+    def label_endpoint(self, label: str) -> str:
+        encoded = quote(label, safe="")
+        return f"repos/{self.owner}/{self.repo}/labels/{encoded}"
+
+    def ensure_label(self, name: str, color: str, description: str) -> None:
+        create = [
+            "api",
+            f"repos/{self.owner}/{self.repo}/labels",
+            "-f",
+            f"name={name}",
+            "-f",
+            f"color={color}",
+            "-f",
+            f"description={description}",
+            "--silent",
+        ]
+        if not try_gh(create):
+            update = [
+                "api",
+                "--method",
+                "PATCH",
+                self.label_endpoint(name),
+                "-f",
+                f"color={color}",
+                "-f",
+                f"description={description}",
+                "--silent",
+            ]
+            run_gh(update, ignore_failure=True)
+
+    def add_label(self, issue: str, label: str) -> None:
+        run_gh(["issue", "edit", issue, "-R", self.repo_arg, "--add-label", label])
+
+    def remove_label(self, issue: str, label: str) -> None:
+        run_gh(
+            ["issue", "edit", issue, "-R", self.repo_arg, "--remove-label", label],
+            ignore_failure=True,
+        )
+
+    def comment(self, issue: str, message: str) -> None:
+        run_gh(["issue", "comment", issue, "-R", self.repo_arg, "--body", message])
+
+    def comment_file(self, issue: str, path: Path) -> None:
+        run_gh(["issue", "comment", issue, "-R", self.repo_arg, "--body-file", str(path)])
+
+    def create_issue(self, title: str, spec_path: Path) -> tuple[str, str]:
+        self.ensure_label(
+            self.running_label,
+            "fbca04",
+            "AgentWS has accepted this issue and is working on it.",
+        )
+        url = run_gh(
+            [
+                "issue",
+                "create",
+                "-R",
+                self.repo_arg,
+                "--title",
+                title,
+                "--body-file",
+                str(spec_path),
+                "--label",
+                self.running_label,
+            ]
+        )
+        match = ISSUE_RE.search(url)
+        if match is None:
+            die(f"could not parse issue number from gh output: {url}")
+        return match.group(1), url
+
+    def mark_open(self, issue: str, message: str | None) -> None:
+        self.ensure_label(
+            self.running_label,
+            "fbca04",
+            "AgentWS has accepted this issue and is working on it.",
+        )
+        self.add_label(issue, self.running_label)
+        if message:
+            self.comment(issue, message)
+
+    def mark_pr_sent(self, issue: str, message: str | None) -> None:
+        self.ensure_label(
+            self.done_label,
+            "0e8a16",
+            "AgentWS has produced a PR or final result for this issue.",
+        )
+        self.add_label(issue, self.done_label)
+        self.remove_label(issue, self.running_label)
+        if message:
+            self.comment(issue, message)
+
+    def show(self, issue: str) -> None:
+        output = run_gh(
+            [
+                "issue",
+                "view",
+                issue,
+                "-R",
+                self.repo_arg,
+                "--json",
+                "number,title,url,state,labels,body",
+            ]
+        )
+        data = json.loads(output)
+        labels = [
+            label.get("name", "")
+            for label in data.get("labels", [])
+            if isinstance(label, dict)
+        ]
+        print(f"# GitHub Issue {data.get('number')}: {data.get('title')}")
+        print()
+        print(f"URL: {data.get('url')}")
+        print(f"GitHub state: {data.get('state')}")
+        print(f"AgentWS state: {self.agentws_state(labels)}")
+        print(f"Labels: {', '.join(labels)}")
+        print()
+        print("## Body")
+        print(data.get("body") or "")
+
+    def list_tasks(self) -> None:
+        self.ensure_label(
+            self.running_label,
+            "fbca04",
+            "AgentWS has accepted this issue and is working on it.",
+        )
+        self.ensure_label(
+            self.done_label,
+            "0e8a16",
+            "AgentWS has produced a PR or final result for this issue.",
+        )
+        seen: set[str] = set()
+        for state, label in (("pr-sent", self.done_label), ("open", self.running_label)):
+            output = run_gh(
+                [
+                    "issue",
+                    "list",
+                    "-R",
+                    self.repo_arg,
+                    "--state",
+                    "all",
+                    "--label",
+                    label,
+                    "--limit",
+                    "100",
+                    "--json",
+                    "number,title",
+                ]
+            )
+            issues = json.loads(output)
+            for issue in issues:
+                number = str(issue.get("number", ""))
+                if not number or number in seen:
+                    continue
+                seen.add(number)
+                print(f"{number}\t{state}\t{issue.get('title')}")
+
+    def agentws_state(self, labels: list[str]) -> str:
+        if self.done_label in labels:
+            return "pr-sent"
+        if self.running_label in labels:
+            return "open"
+        return "untracked"
+
+
+def usage(status: int = 1) -> None:
+    print(
+        "Usage: task-github create <title> <spec-file>\n"
+        "       task-github comment <issue-number> <message>\n"
+        "       task-github state <issue-number> <open|pr-sent> [message]\n"
+        "       task-github result <issue-number> <result-file>\n"
+        "       task-github show <issue-number>\n"
+        "       task-github list",
+        file=sys.stderr,
+    )
+    raise SystemExit(status)
+
+
+def main(argv: list[str]) -> int:
+    if len(argv) < 2:
+        usage()
+    if argv[1] in ("--help", "-h"):
+        usage(0)
+
+    owner, repo = upstream_repo()
+    gh = GitHub(owner, repo, authenticated_login())
+
+    command = argv[1]
+    if command == "create":
+        if len(argv) != 4:
+            usage()
+        title = argv[2]
+        spec_path = Path(argv[3])
+        if not spec_path.is_file():
+            die(f"spec file '{spec_path}' does not exist")
+        number, url = gh.create_issue(title, spec_path)
+        print(number)
+        print(url)
+        return 0
+
+    if command == "comment":
+        if len(argv) != 4:
+            usage()
+        gh.comment(argv[2], argv[3])
+        return 0
+
+    if command == "state":
+        if len(argv) not in (4, 5):
+            usage()
+        issue = argv[2]
+        state = argv[3]
+        message = argv[4] if len(argv) == 5 and argv[4] else None
+        if state == "open":
+            gh.mark_open(issue, message)
+        elif state == "pr-sent":
+            gh.mark_pr_sent(issue, message)
+        else:
+            die("state must be open or pr-sent")
+        return 0
+
+    if command == "result":
+        if len(argv) != 4:
+            usage()
+        result_path = Path(argv[3])
+        if not result_path.is_file():
+            die(f"result file '{result_path}' does not exist")
+        gh.comment_file(argv[2], result_path)
+        return 0
+
+    if command == "show":
+        if len(argv) != 3:
+            usage()
+        gh.show(argv[2])
+        return 0
+
+    if command == "list":
+        if len(argv) != 2:
+            usage()
+        gh.list_tasks()
+        return 0
+
+    usage()
+    return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv))
